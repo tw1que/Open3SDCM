@@ -14,8 +14,12 @@ import struct
 import tempfile
 from urllib.parse import unquote
 import webbrowser
+import zipfile
 
 MAX_DCM_BYTES = 100 * 1024 * 1024
+MAX_BATCH_FILES = 20
+MAX_BATCH_BYTES = 500 * 1024 * 1024
+MAX_MANIFEST_BYTES = 16 * 1024
 INDEX_HTML = Path(__file__).with_name("index.html")
 
 
@@ -88,6 +92,9 @@ class Handler(BaseHTTPRequestHandler):
         self.send_bytes(200, INDEX_HTML.read_bytes(), "text/html; charset=utf-8")
 
     def do_POST(self) -> None:
+        if self.path == "/convert-batch":
+            self.convert_batch()
+            return
         if self.path != "/convert":
             self.fail(404, "Endpoint niet gevonden.")
             return
@@ -135,6 +142,119 @@ class Handler(BaseHTTPRequestHandler):
                     shutil.copyfileobj(f, self.wfile, 1024 * 1024)
             except (OSError, ValueError, RuntimeError, IndexError, OverflowError):
                 self.fail(422, "Geen geldige STL gegenereerd. Het DCM-bestand kan versleuteld, beschadigd of niet ondersteund zijn.")
+
+
+    @staticmethod
+    def valid_filename(filename: object) -> bool:
+        return (
+            isinstance(filename, str)
+            and 0 < len(filename) <= 200
+            and filename.lower().endswith(".dcm")
+            and not any(c in filename for c in ("/", "\\", "\0", "\r", "\n"))
+            and not any(ord(c) < 32 for c in filename)
+        )
+
+    def convert_batch(self) -> None:
+        """Protocol: 4-byte big-endian JSON byte length, UTF-8 manifest, raw files.
+
+        Manifest: [{"name": "scan.dcm", "size": 123}, ...]. The byte sizes
+        delimit each file. Content-Length must exactly match the entire body.
+        All data stays on the local machine, streamed to temporary files.
+        """
+        try:
+            size = int(self.headers.get("Content-Length", ""))
+        except ValueError:
+            self.fail(411, "Bestandsgrootte ontbreekt.")
+            return
+        if not 4 < size <= MAX_BATCH_BYTES + MAX_MANIFEST_BYTES + 4:
+            self.fail(413, "De batch is te groot (maximaal 500 MB).")
+            return
+
+        header = self.rfile.read(4)
+        if len(header) != 4:
+            self.fail(400, "Onvolledige batch-header.")
+            return
+        manifest_size = struct.unpack(">I", header)[0]
+        if not 2 <= manifest_size <= MAX_MANIFEST_BYTES or size < manifest_size + 4:
+            self.fail(400, "Ongeldig batch-overzicht.")
+            return
+        try:
+            manifest = json.loads(self.rfile.read(manifest_size).decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            self.fail(400, "Ongeldig batch-overzicht.")
+            return
+        if not isinstance(manifest, list) or not 2 <= len(manifest) <= MAX_BATCH_FILES:
+            self.fail(400, "Selecteer 2 tot 20 DCM-bestanden.")
+            return
+        for item in manifest:
+            if (not isinstance(item, dict)
+                or not self.valid_filename(item.get("name"))
+                or type(item.get("size")) is not int
+                or not 1 <= item["size"] <= MAX_DCM_BYTES):
+                self.fail(400, "Ongeldige bestandsnaam of bestandsgrootte (maximaal 100 MB per DCM).")
+                return
+        total = sum(item["size"] for item in manifest)
+        if total > MAX_BATCH_BYTES or size != 4 + manifest_size + total:
+            self.fail(400, "Bestandsgroottes kloppen niet (maximaal 500 MB totaal).")
+            return
+
+        with tempfile.TemporaryDirectory(prefix="open3sdcm-batch-") as temp:
+            root = Path(temp)
+            zip_path = root / "result.zip"
+            success = 0
+            errors = []
+            used_names = set()
+            try:
+                with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=2) as archive:
+                    for i, item in enumerate(manifest):
+                        source = root / f"source-{i}.dcm"
+                        target = root / f"output-{i}.stl"
+                        remaining = item["size"]
+                        with source.open("wb") as out:
+                            while remaining:
+                                chunk = self.rfile.read(min(1024 * 1024, remaining))
+                                if not chunk:
+                                    raise EOFError("Batch-upload is onvolledig.")
+                                out.write(chunk)
+                                remaining -= len(chunk)
+                        try:
+                            count = convert_dcm_to_stl(source, target)
+                            if target.stat().st_size != 84 + 50 * count or count < 1:
+                                raise ValueError("STL-export is ongeldig")
+                            name = item["name"][:-4] + ".stl"
+                            stem = name[:-4]
+                            suffix = 2
+                            while name.casefold() in used_names:
+                                name = f"{stem}_{suffix}.stl"
+                                suffix += 1
+                            used_names.add(name.casefold())
+                            archive.write(target, arcname=name)
+                            success += 1
+                        except (OSError, ValueError, RuntimeError, IndexError, OverflowError, MemoryError) as error:
+                            errors.append(f"{item['name']}: conversie mislukt ({type(error).__name__}); mogelijk versleuteld of niet ondersteund.")
+                        finally:
+                            source.unlink(missing_ok=True)
+                            target.unlink(missing_ok=True)
+                    if errors:
+                        archive.writestr("conversie-fouten.txt", "\n".join(errors) + "\n")
+                if not success:
+                    self.fail(422, "Geen van de bestanden kon worden geconverteerd. Mogelijk versleutelde of niet-ondersteunde DCM-bestanden.")
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "application/zip")
+                self.send_header("Content-Disposition", 'attachment; filename="converted-stl.zip"')
+                self.send_header("Content-Length", str(zip_path.stat().st_size))
+                self.send_header("X-Converted-Count", str(success))
+                self.send_header("X-Failed-Count", str(len(errors)))
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.end_headers()
+                with zip_path.open("rb") as downloaded:
+                    shutil.copyfileobj(downloaded, self.wfile, 1024 * 1024)
+            except EOFError:
+                self.fail(400, "Batch-upload is onvolledig.")
+            except OSError:
+                self.fail(500, "Fout tijdens batchconversie.")
 
 
 def main() -> None:
