@@ -1,15 +1,17 @@
 # DCM → STL — Windows
 
-**One-time setup:** Extract the ZIP, then double-click **start.bat**.
+1. Pak de ZIP uit.
+2. Dubbelklik `start.bat` (de eerste keer is internet nodig om het Python-pakket te installeren).
+3. De browser opent op http://127.0.0.1:8765.
+4. Sleep een of meerdere DCM-bestanden erin, of klik op **Bestanden kiezen**.
 
-The first launch installs the published `open3sdcm` Python converter (requires internet). Thereafter it works locally, without cloud uploads. The browser opens automatically at http://127.0.0.1:8765 . Drop one `.dcm` file and the converted `.stl` downloads automatically.
+Eén DCM wordt een STL-download. Meerdere DCM's (maximaal 20) worden één ZIP met de geslaagde STL's. Fouten staan in `conversie-fouten.txt` in dezelfde ZIP.
 
-**Manual alternative:**
+Maximaal 100 MB per bestand en 500 MB totaal. Conversies lopen na elkaar. Alles blijft lokaal op de computer. Versleutelde of niet-ondersteunde DCM's kunnen falen.
+
+Handmatig:
 
 ```cmd
 python -m pip install --only-binary=:all: open3sdcm==1.1.4
 python web/app.py
 ```
-
-Requires **64-bit Python 3.9+** on Windows, installed with `pip` support.
-Only one file at a time, max 100 MB. Some encrypted CE files cannot be read. STL is geometry-only.
