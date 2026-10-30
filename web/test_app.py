@@ -1,6 +1,8 @@
 """HTTP and binary STL tests, with the native converter mocked."""
 
 import http.client
+import io
+import zipfile
 from http.server import ThreadingHTTPServer
 import json
 from pathlib import Path
@@ -105,6 +107,91 @@ class WebTests(unittest.TestCase):
             code, _, content = self.request("POST", "/convert", b"DCM", {"X-Filename": "scan.dcm"})
         self.assertEqual(code, 422)
         self.assertIn("Geen geldige STL", json.loads(content)["error"])
+
+
+    @staticmethod
+    def batch_body(items):
+        manifest = json.dumps([{"name": name, "size": len(data)} for name, data in items]).encode("utf-8")
+        return struct.pack(">I", len(manifest)) + manifest + b"".join(data for _, data in items)
+
+    def test_batch_two_good_files_returns_one_zip(self):
+        good_stl = b"\0" * 80 + struct.pack("<I", 1) + b"\0" * 50
+        seen = []
+
+        def convert(src, target):
+            seen.append(src.read_bytes())
+            target.write_bytes(good_stl)
+            return 1
+
+        body = self.batch_body([("first.dcm", b"AAA"), ("second.dcm", b"BBB")])
+        with patch("web.app.convert_dcm_to_stl", side_effect=convert):
+            code, headers, data = self.request("POST", "/convert-batch", body)
+        self.assertEqual(code, 200)
+        self.assertEqual(headers["Content-Type"], "application/zip")
+        self.assertEqual(headers["X-Converted-Count"], "2")
+        self.assertEqual(headers["X-Failed-Count"], "0")
+        self.assertEqual(seen, [b"AAA", b"BBB"])
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            self.assertEqual(sorted(archive.namelist()), ["first.stl", "second.stl"])
+            self.assertEqual(archive.read("first.stl"), good_stl)
+
+    def test_batch_failure_keeps_successful_outputs_and_report(self):
+        good_stl = b"\0" * 80 + struct.pack("<I", 1) + b"\0" * 50
+
+        def convert(src, target):
+            if src.read_bytes() == b"BAD":
+                raise ValueError("invalid dcm")
+            target.write_bytes(good_stl)
+            return 1
+
+        body = self.batch_body([("good.dcm", b"OK"), ("bad.dcm", b"BAD")])
+        with patch("web.app.convert_dcm_to_stl", side_effect=convert):
+            code, headers, data = self.request("POST", "/convert-batch", body)
+        self.assertEqual(code, 200)
+        self.assertEqual(headers["X-Converted-Count"], "1")
+        self.assertEqual(headers["X-Failed-Count"], "1")
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            self.assertEqual(sorted(archive.namelist()), ["conversie-fouten.txt", "good.stl"])
+            self.assertIn("bad.dcm", archive.read("conversie-fouten.txt").decode())
+
+    def test_batch_duplicate_names_get_unique_entries(self):
+        good_stl = b"\0" * 80 + struct.pack("<I", 1) + b"\0" * 50
+        def convert(_, target):
+            target.write_bytes(good_stl)
+            return 1
+        body = self.batch_body([("scan.dcm", b"A"), ("SCAN.dcm", b"B")])
+        with patch("web.app.convert_dcm_to_stl", side_effect=convert):
+            code, _, data = self.request("POST", "/convert-batch", body)
+        self.assertEqual(code, 200)
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            self.assertEqual(sorted(archive.namelist()), ["SCAN_2.stl", "scan.stl"])
+
+    def test_batch_all_fail_returns_error(self):
+        body = self.batch_body([("one.dcm", b"A"), ("two.dcm", b"B")])
+        with patch("web.app.convert_dcm_to_stl", side_effect=ValueError("bad")):
+            code, _, data = self.request("POST", "/convert-batch", body)
+        self.assertEqual(code, 422)
+        self.assertIn("Geen van de bestanden", json.loads(data)["error"])
+
+    def test_batch_mismatch_length_rejected(self):
+        body = self.batch_body([("one.dcm", b"A"), ("two.dcm", b"B")]) + b"X"
+        code, _, _ = self.request("POST", "/convert-batch", body)
+        self.assertEqual(code, 400)
+
+    def test_batch_truncated_body_rejected(self):
+        body = self.batch_body([("one.dcm", b"A"), ("two.dcm", b"B")])[:-1]
+        code, _, _ = self.request("POST", "/convert-batch", body)
+        self.assertEqual(code, 400)
+
+    def test_batch_rejects_directory_names(self):
+        body = self.batch_body([("../one.dcm", b"A"), ("two.dcm", b"B")])
+        code, _, _ = self.request("POST", "/convert-batch", body)
+        self.assertEqual(code, 400)
+
+    def test_batch_rejects_more_than_20(self):
+        body = self.batch_body([(f"{i}.dcm", b"A") for i in range(21)])
+        code, _, _ = self.request("POST", "/convert-batch", body)
+        self.assertEqual(code, 400)
 
 
 if __name__ == "__main__":
