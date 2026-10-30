@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="nl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DCM → STL</title>
+  <style>
+    :root { color-scheme: light; font-family: system-ui, -apple-system, Segoe UI, sans-serif; }
+    * { box-sizing: border-box; }
+    body { min-height: 100vh; margin: 0; display: grid; place-items: center; background: #f6f7f8; color: #18212a; padding: 20px; }
+    main { width: min(100%, 480px); }
+    h1 { font-size: clamp(28px, 6vw, 36px); font-weight: 650; letter-spacing: -1px; margin: 0 0 12px; }
+    p { color: #53616d; margin: 0 0 24px; line-height: 1.5; }
+    #dropzone { border: 2px dashed #c5cdd5; border-radius: 16px; padding: 48px 22px; text-align: center; background: #fff; transition: background .15s,border-color .15s; cursor: pointer; outline-offset: 4px; }
+    #dropzone.dragging, #dropzone:focus-visible { background: #eef5ff; border-color: #3675b8; }
+    #dropzone.busy { opacity: .65; pointer-events: none; }
+    .symbol { display: block; font-size: 40px; line-height: 1; margin-bottom: 20px; color: #3174b4; }
+    .heading { display: block; font-weight: 600; font-size: 17px; margin-bottom: 8px; }
+    .hint { display: block; color: #697781; font-size: 14px; margin-bottom: 22px; }
+    button { font: inherit; font-size: 14px; font-weight: 600; border: 0; border-radius: 9px; padding: 12px 18px; background: #1a2733; color: #fff; cursor: pointer; }
+    button:disabled { opacity: .6; cursor: wait; }
+    #status { margin: 18px 0 0; min-height: 24px; font-size: 14px; overflow-wrap: anywhere; }
+    #status.error { color: #b12a31; }
+    #status.success { color: #176c45; }
+    footer { margin-top: 24px; color: #697781; font-size: 12px; line-height: 1.5; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>DCM → STL</h1>
+    <p>Zet één of meerdere 3Shape DCM-bestanden om naar STL.</p>
+    <div id="dropzone" role="button" tabindex="0" aria-label="Sleep DCM-bestanden hierheen of selecteer bestanden">
+      <span class="symbol" aria-hidden="true">⇩</span>
+      <span class="heading">Sleep je DCM-bestanden hierheen</span>
+      <span class="hint">of selecteer bestanden · max. 20 bestanden, 100 MB per bestand</span>
+      <button type="button" id="choose">Bestanden kiezen</button>
+      <input id="file" type="file" accept=".dcm" multiple hidden>
+    </div>
+    <div id="status" role="status" aria-live="polite"></div>
+    <footer>De conversie draait lokaal op je computer. Alle bestanden worden na afloop verwijderd uit de tijdelijke werkmap.</footer>
+  </main>
+  <script>
+    const dropzone = document.getElementById('dropzone');
+    const choose = document.getElementById('choose');
+    const input = document.getElementById('file');
+    const status = document.getElementById('status');
+    let busy = false;
+
+    const message = (text, kind = '') => { status.textContent = text; status.className = kind; };
+    const pick = () => { if (!busy) input.click(); };
+    choose.addEventListener('click', event => { event.stopPropagation(); pick(); });
+    dropzone.addEventListener('click', pick);
+    dropzone.addEventListener('keydown', event => {
+      if (event.target === dropzone && (event.key === 'Enter' || event.key === ' ')) {
+        event.preventDefault(); pick();
+      }
+    });
+    input.addEventListener('change', () => { if (input.files.length) convert(Array.from(input.files)); input.value = ''; });
+    for (const eventName of ['dragenter', 'dragover']) {
+      dropzone.addEventListener(eventName, event => { event.preventDefault(); if (!busy) dropzone.classList.add('dragging'); });
+    }
+    for (const eventName of ['dragleave', 'drop']) {
+      dropzone.addEventListener(eventName, event => { event.preventDefault(); dropzone.classList.remove('dragging'); });
+    }
+    dropzone.addEventListener('drop', event => { if (!busy && event.dataTransfer.files.length) convert(Array.from(event.dataTransfer.files)); });
+    document.addEventListener('dragover', event => event.preventDefault());
+    document.addEventListener('drop', event => event.preventDefault());
+
+    async function convert(files) {
+      if (busy || !files.length) return;
+      const mb = 1024 * 1024;
+      if (files.length > 20) { message('Selecteer maximaal 20 DCM-bestanden.', 'error'); return; }
+      if (files.some(file => !file.name.toLowerCase().endsWith('.dcm'))) {
+        message('Selecteer uitsluitend .dcm-bestanden.', 'error'); return;
+      }
+      if (files.some(file => !file.size || file.size > 100 * mb)) {
+        message('Elk DCM-bestand moet tussen 1 byte en 100 MB groot zijn.', 'error'); return;
+      }
+      if (files.reduce((sum, file) => sum + file.size, 0) > 500 * mb) {
+        message('De batch mag maximaal 500 MB zijn.', 'error'); return;
+      }
+
+      busy = true;
+      choose.disabled = true;
+      dropzone.classList.add('busy');
+      const batch = files.length > 1;
+      message(batch ? `Converteren: ${files.length} bestanden …` : `Converteren: ${files[0].name} …`);
+      try {
+        let response;
+        if (batch) {
+          // Streaming-friendly binary batch: 4-byte manifest length,
+          // UTF-8 JSON manifest, then each file's bytes in order.
+          const manifest = new TextEncoder().encode(JSON.stringify(
+            files.map(file => ({ name: file.name, size: file.size }))
+          ));
+          const prefix = new ArrayBuffer(4);
+          new DataView(prefix).setUint32(0, manifest.length, false);
+          response = await fetch('/convert-batch', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/octet-stream' },
+            body: new Blob([prefix, manifest, ...files])
+          });
+        } else {
+          response = await fetch('/convert', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/octet-stream', 'X-Filename': encodeURIComponent(files[0].name) },
+            body: files[0]
+          });
+        }
+        if (!response.ok) {
+          const result = await response.json().catch(() => ({}));
+          throw new Error(result.error || 'Conversie mislukt (HTTP ' + response.status + ').');
+        }
+        const blob = await response.blob();
+        const url = URL.createObjectURL(blob);
+        const name = batch ? 'converted-stl.zip' : files[0].name.replace(/\.dcm$/i, '.stl');
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = name;
+        document.body.append(link);
+        link.click();
+        link.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 10000);
+        if (batch) {
+          const ok = Number(response.headers.get('X-Converted-Count') || 0);
+          const failed = Number(response.headers.get('X-Failed-Count') || 0);
+          message(`Klaar: ${ok} STL-bestanden in ${name} gedownload.` +
+            (failed ? ` ${failed} mislukt; zie conversie-fouten.txt in ZIP.` : ''), failed ? 'error' : 'success');
+        } else {
+          message('Klaar: ' + name + ' is gedownload.', 'success');
+        }
+      } catch (error) {
+        message(error.message || 'Er is iets misgegaan.', 'error');
+      } finally {
+        busy = false;
+        choose.disabled = false;
+        dropzone.classList.remove('busy');
+      }
+    }
+
+  </script>
+</body>
+</html>
