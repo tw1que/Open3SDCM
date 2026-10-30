@@ -1,23 +1,54 @@
-"""HTTP smoke tests that do not require a compiled Open3SDCMCLI."""
-
-from __future__ import annotations
+"""HTTP and binary STL tests, with the native converter mocked."""
 
 import http.client
+from http.server import ThreadingHTTPServer
+import json
 from pathlib import Path
 import struct
+import sys
+import tempfile
 import threading
+import types
 import unittest
 from unittest.mock import patch
-from http.server import ThreadingHTTPServer
-from types import SimpleNamespace
 
-from web.app import Handler
+import numpy as np
+from web.app import Handler, convert_dcm_to_stl
+
+
+class BinaryStlTests(unittest.TestCase):
+    def test_writer_normals_and_geometry(self):
+        mesh = types.SimpleNamespace(
+            vertices=np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0]], dtype=np.float32),
+            faces=np.array([[0, 1, 2]], dtype=np.uint64),
+        )
+        with patch.dict(sys.modules, {"open3sdcm": types.SimpleNamespace(load=lambda _: mesh)}):
+            with tempfile.TemporaryDirectory() as root:
+                stl = Path(root) / "result.stl"
+                count = convert_dcm_to_stl(Path(root) / "example.dcm", stl)
+                data = stl.read_bytes()
+        self.assertEqual(count, 1)
+        self.assertEqual(len(data), 134)
+        self.assertEqual(struct.unpack_from('<I', data, 80)[0], 1)
+        normal = struct.unpack_from('<3f', data, 84)
+        self.assertEqual(normal, (0.0, 0.0, 1.0))
+        corners = struct.unpack_from('<9f', data, 96)
+        self.assertEqual(corners, (0, 0, 0, 1, 0, 0, 0, 1, 0))
+
+    def test_writer_invalid_indices(self):
+        mesh = types.SimpleNamespace(
+            vertices=np.array([[0, 0, 0]], dtype=np.float32),
+            faces=np.array([[0, 1, 2]], dtype=np.uint64),
+        )
+        with patch.dict(sys.modules, {"open3sdcm": types.SimpleNamespace(load=lambda _: mesh)}):
+            with tempfile.TemporaryDirectory() as root:
+                with self.assertRaises(ValueError):
+                    convert_dcm_to_stl(Path(root) / "example.dcm", Path(root) / "result.stl")
 
 
 class WebTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        Handler.cli = "dummy-cli"
         cls.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
         cls.thread.start()
@@ -57,25 +88,23 @@ class WebTests(unittest.TestCase):
     def test_success_returns_valid_stl(self):
         stl = b"\0" * 80 + struct.pack("<I", 1) + b"\0" * 50
 
-        def cli_run(command, **_):
-            out = Path(command[command.index("-o") + 1]) / "2026-10-30-09-00-00"
-            out.mkdir()
-            (out / "input.stl").write_bytes(stl)
-            self.assertEqual(command[-1], "stl")
-            return SimpleNamespace(returncode=0)
+        def conversion(src, target):
+            self.assertEqual(src.read_bytes(), b"DCM")
+            target.write_bytes(stl)
+            return 1
 
-        with patch("web.app.subprocess.run", side_effect=cli_run):
+        with patch("web.app.convert_dcm_to_stl", side_effect=conversion):
             code, headers, content = self.request("POST", "/convert", b"DCM", {"X-Filename": "scan.dcm"})
         self.assertEqual(code, 200)
         self.assertEqual(content, stl)
         self.assertEqual(headers["X-Triangle-Count"], "1")
         self.assertEqual(headers["Content-Type"], "model/stl")
 
-    def test_false_success_without_stl(self):
-        with patch("web.app.subprocess.run", return_value=SimpleNamespace(returncode=0)):
+    def test_failure_returns_422(self):
+        with patch("web.app.convert_dcm_to_stl", side_effect=ValueError("bad scan")):
             code, _, content = self.request("POST", "/convert", b"DCM", {"X-Filename": "scan.dcm"})
         self.assertEqual(code, 422)
-        self.assertIn(b"geen geldige stl", content.lower())
+        self.assertIn("Geen geldige STL", json.loads(content)["error"])
 
 
 if __name__ == "__main__":
